@@ -1,0 +1,6 @@
+{
+  "name": "k9s-web", "version": "1.0.0", "private": true, "type": "module",
+  "engines": {"node": ">=22"},
+  "scripts": {"start": "node server.mjs", "demo": "node server.mjs --demo", "test": "node --test"},
+  "dependencies": {"@kubernetes/client-node": "^2.0.2", "js-yaml": "5.5.0"}
+}

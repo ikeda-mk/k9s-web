@@ -1,0 +1,48 @@
+import {test,before,after} from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import {once} from 'node:events';
+import {KubeConfig} from '@kubernetes/client-node';
+import {load} from 'js-yaml';
+import {Kubernetes,configuration,resourcePath} from '../kubernetes.mjs';
+import {Demo,demoObjects} from '../demo.mjs';
+import {createServer} from '../server.mjs';
+let upstream,server,client,base,kc,origin;const requests=[];
+async function listen(s){s.listen(0,'127.0.0.1');await once(s,'listening');return `http://127.0.0.1:${s.address().port}`;}
+before(async()=>{
+ upstream=http.createServer((req,res)=>{requests.push({url:req.url,headers:req.headers});const url=new URL(req.url,'http://mock');const send=(n,data)=>{res.writeHead(n,{'Content-Type':'application/json'});res.end(typeof data==='string'?data:JSON.stringify(data));};
+ if(url.pathname.includes('/forbidden/'))return send(403,{message:'secret upstream message'});
+ if(url.pathname.includes('/missing'))return send(404,{});
+ if(url.pathname.includes('/timeout/'))return;
+ if(url.pathname.endsWith('/log')){if(req.headers.accept!=='application/json, */*;q=0.8')return send(406,{});res.writeHead(200,{'Content-Type':'text/plain'});return res.end(url.searchParams.get('container')==='huge'?'x'.repeat(1024*1024+1):'<script>alert(1)</script>\nhello');}
+ if(url.pathname==='/api/v1/namespaces')return send(200,{items:[{metadata:{name:'default'}}],metadata:{}});
+ const kind=['deployments','services','ingresses','pods'].find(k=>url.pathname.includes('/'+k));
+ if(!kind)return send(404,{});
+ const ns=url.pathname.match(/namespaces\/([^/]+)/)?.[1] || 'default';
+ if(url.pathname.endsWith('/'+kind))return send(200,{items:demoObjects(kind,ns),metadata:{continue:url.searchParams.has('continue')?'':'page2'}});
+ const obj=demoObjects(kind,ns)[0];obj.metadata.resourceVersion='123';obj.metadata.managedFields=[{secret:'private'}];obj.metadata.annotations['kubectl.kubernetes.io/last-applied-configuration']='secret';return send(200,obj);
+ });
+ origin=await listen(upstream);kc=new KubeConfig();kc.loadFromOptions({clusters:[{name:'a',server:origin,skipTLSVerify:true},{name:'b',server:origin+'/context-b',skipTLSVerify:true}],users:[{name:'u',token:'DO-NOT-LEAK'}],contexts:[{name:'alpha',cluster:'a',user:'u',namespace:'default'},{name:'beta',cluster:'b',user:'u',namespace:'staging'}],currentContext:'alpha'});
+ client=new Kubernetes({kubeConfig:kc,timeout:150});server=createServer({backend:client});base=await listen(server);
+});
+after(async()=>{server.closeAllConnections();upstream.closeAllConnections();await Promise.all([new Promise(r=>server.close(r)),new Promise(r=>upstream.close(r))]);});
+const api=(path,params={})=>fetch(`${base}/api/${path}?${new URLSearchParams(params)}`,{headers:{'X-Kube-Local':'1'}});
+test('Context一覧は認証情報を含まない',async()=>{const res=await api('contexts');const data=await res.json();assert.equal(res.status,200);assert.deepEqual(data.contexts,[{name:'alpha',namespace:'default'},{name:'beta',namespace:'staging'}]);assert.ok(!JSON.stringify(data).includes('DO-NOT-LEAK'));});
+test('Contextごとの接続先を使用しcurrent-contextを変更しない',async()=>{await client.resources({context:'beta',kind:'pods'});assert.match(requests.at(-1).url,/^\/context-b\/api\/v1\/pods/);assert.equal(kc.getCurrentContext(),'alpha');});
+test('不明Contextを拒否',async()=>{await assert.rejects(client.resources({context:'other',kind:'pods'}),e=>e.status===400);});
+test('Namespace一覧',async()=>{assert.deepEqual(await client.namespaces({context:'alpha'}),{items:['default']});});
+for(const kind of ['pods','deployments','services','ingresses']) test(`${kind}の一覧と500件ページング`,async()=>{const res=await api('resources',{context:'alpha',namespace:'default',kind});assert.equal(res.status,200);const data=await res.json();assert.equal(data.items.length,2);assert.equal(data.continuation,'page2');assert.match(requests.at(-1).url,/limit=500/);await client.resources({context:'alpha',kind,continuation:'page2'});assert.match(requests.at(-1).url,/continue=page2/);assert.ok(!requests.at(-1).url.includes('/namespaces/'));assert.ok(!JSON.stringify(data).includes('env'));});
+test('Ingress networking.k8s.io/v1 APIパス',()=>{assert.equal(resourcePath('ingresses','default','web'),'/apis/networking.k8s.io/v1/namespaces/default/ingresses/web');});
+for(const kind of ['deployments','services','ingresses']) test(`${kind}設定のGETとYAML/JSON一致`,async()=>{const res=await api('config',{context:'alpha',namespace:'default',kind,name:'web'});const data=await res.json();assert.equal(res.status,200);assert.deepEqual(load(data.yaml),data.config);assert.equal(data.config.metadata.name,'web');assert.ok(!JSON.stringify(data).includes('last-applied-configuration'));assert.equal(data.config.status,undefined);assert.equal(data.config.metadata.resourceVersion,undefined);});
+test('通常・init・ephemeralコンテナenvとネストした注釈のマスク',()=>{const object=demoObjects('deployments')[0];const s=object.spec.template.spec;for(const type of ['containers','initContainers','ephemeralContainers'])s[type]=[{name:type,env:[{name:'PASSWORD',value:'private'},{name:'REF',valueFrom:{secretKeyRef:{name:'secret',key:'password'}}}]}];object.spec.template.metadata.annotations={'kubectl.kubernetes.io/last-applied-configuration':'private',keep:'yes'};object.spec.futureField={future:'preserved'};const data=configuration(object);assert.ok(!JSON.stringify(data).includes('private'));for(const key of ['containers','initContainers','ephemeralContainers'])assert.equal(data.config.spec.template.spec[key][0].env[0].value,'[REDACTED]');assert.equal(data.config.spec.template.spec.containers[0].env[1].valueFrom.secretKeyRef.key,'password');assert.deepEqual(load(data.yaml),data.config);assert.equal(data.config.spec.futureField.future,'preserved');});
+test('任意リソースと不正パスを拒否',async()=>{for(const p of [{kind:'secrets',namespace:'default',name:'x'},{kind:'pods',namespace:'default',name:'x'},{kind:'services',namespace:'../default',name:'x'},{kind:'services',namespace:'default',name:'x/y'},{kind:'services',namespace:'default',name:''},{kind:'services',namespace:'',name:'x'}]){const res=await api('config',{context:'alpha',...p});assert.equal(res.status,400);}});
+test('ログAcceptのHTTP406回帰と文字列・行数・サイズ指定',async()=>{const data=await client.logs({context:'alpha',namespace:'default',pod:'web',container:'web',previous:'true'});assert.equal(typeof data.text,'string');assert.match(data.text,/<script>/);const last=requests.at(-1);assert.equal(last.headers.accept,'application/json, */*;q=0.8');assert.match(last.url,/tailLines=300/);assert.match(last.url,/limitBytes=1048576/);assert.match(last.url,/previous=true/);});
+test('ログ最大1MiB',async()=>{await assert.rejects(client.logs({context:'alpha',namespace:'default',pod:'web',container:'huge'}),e=>e.status===502);});
+for(const [ns,name,status] of [['forbidden','web',403],['default','missing',404]])test(`設定HTTP${status}と機密エラー非転送`,async()=>{const res=await api('config',{context:'alpha',namespace:ns,kind:'services',name});assert.equal(res.status,status);const text=await res.text();assert.ok(!text.includes('secret upstream'));assert.match(text,new RegExp(String(status)));});
+test('タイムアウト',async()=>{await assert.rejects(client.resources({context:'alpha',namespace:'timeout',kind:'pods'}),e=>e.status===504);});
+test('通信中断',async()=>{const c=new AbortController();const pending=client.resources({context:'alpha',namespace:'timeout',kind:'pods'},{signal:c.signal});setTimeout(()=>c.abort(),20);await assert.rejects(pending,e=>e.status===499);});
+test('外部Origin・Fetch Metadata・専用ヘッダー欠落を拒否',async()=>{for(const headers of [{},{'X-Kube-Local':'1',Origin:'https://evil.example'},{'X-Kube-Local':'1','Sec-Fetch-Site':'cross-site'}]){const res=await fetch(base+'/api/contexts',{headers});assert.equal(res.status,403);}});
+test('不正Hostを拒否',async()=>{const res=await fetch(base+'/api/info',{headers:{Host:'evil.example','X-Kube-Local':'1'}});assert.equal(res.status,403);});
+test('変更メソッドと未知API拒否',async()=>{assert.equal((await fetch(base+'/api/config',{method:'POST',headers:{'X-Kube-Local':'1'}})).status,405);assert.equal((await api('unknown')).status,404);});
+test('デモはKubernetes接続なしで全種別・設定・ログを返す',async()=>{const demo=new Demo();const context='demo-development';for(const kind of Object.keys({pods:1,services:1,deployments:1,ingresses:1})){assert.equal((await demo.resources({context,kind})).items.length,4);if(kind!=='pods')assert.ok((await demo.config({context,kind,namespace:'default',name:'web'})).yaml);}assert.match((await demo.logs({context,namespace:'default',pod:'web-7d8f6-abc12',container:'web'})).text,/現在のログ/);});
+test('静的ファイルにCSPと文字コードを設定',async()=>{const res=await fetch(base);assert.equal(res.status,200);assert.match(res.headers.get('content-security-policy'),/frame-ancestors 'none'/);assert.match(await res.text(),/Namespace/);assert.equal((await fetch(base+'/package.json')).status,404);});
